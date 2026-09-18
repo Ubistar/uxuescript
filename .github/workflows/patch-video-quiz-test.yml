@@ -1,0 +1,206 @@
+name: Patch video quiz direct-answer test
+
+on:
+  push:
+    branches:
+      - test/video-interactive-quiz-direct-answer
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test/video-interactive-quiz-direct-answer
+      - name: Patch core.js
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('src-tauri/src/scripts/core.js')
+          text = path.read_text(encoding='utf-8')
+
+          old_get = '''  /** @type {(timeline: HTMLElement) => ExtQuizData[]} */
+          const getInteractiveQuizAnswers = (timeline) => {
+            const videoWindow = /** @type {VideoWindow | null} */ (
+              timeline.ownerDocument.defaultView
+            );
+            const datas =
+              videoWindow?.Ext?.getCmp?.(timeline.id)?.objects?.find(
+                ({ style }) => style === "InteractiveQuiz",
+              )?.datas ?? [];
+            return datas.map(({ answered, answerContent, options }) => ({
+              answered,
+              answerContent,
+              options,
+            }));
+          };
+          '''
+          new_get = '''  /** @type {(timeline: HTMLElement) => ExtQuizData[]} */
+          const getInteractiveQuizAnswers = (timeline) => {
+            const videoWindow = /** @type {VideoWindow | null} */ (
+              timeline.ownerDocument.defaultView
+            );
+            const objects = videoWindow?.Ext?.getCmp?.(timeline.id)?.objects ?? [];
+            const datas = objects
+              .filter(({ style }) =>
+                style === "InteractiveQuiz" || String(style).toUpperCase() === "QUIZ",
+              )
+              .flatMap(({ datas }) => datas ?? []);
+            return datas.map(({ answered, answerContent, options }) => ({
+              answered,
+              answerContent,
+              options,
+            }));
+          };
+          '''
+
+          old_handle = '''  /** @type {(taskDoc: Document, videoEl: HTMLMediaElement) => Promise<void>} */
+          const handleInteractiveQuiz = async (taskDoc, videoEl) => {
+            const timeline = await wait.element(
+              null,
+              SELECTORS.video.timelineClass,
+              taskDoc,
+            );
+            const answers = await wait.until(() => {
+              const result = getInteractiveQuizAnswers(timeline);
+              return result.length ? result : null;
+            });
+            if (!answers || answers.every((answer) => answer.answered)) return;
+
+            const quizRoot = await observeInteractiveQuiz(timeline, videoEl);
+            if (!quizRoot) return;
+
+            const quizItems = await wait.elements(
+              null,
+              SELECTORS.video.quizItemClass,
+              quizRoot,
+            );
+
+            for (const [index, answer] of answers.entries()) {
+              if (!answer.answered && quizItems[index])
+                await fillInteractiveQuiz(quizItems[index], answer);
+            }
+
+            const submitButton = await wait.element(
+              null,
+              SELECTORS.video.quizSubmitId,
+              quizRoot,
+            );
+            submitButton.click();
+
+            const continueButton = await wait.element(
+              null,
+              SELECTORS.video.quizContinueId,
+              quizRoot,
+            );
+            await wait.until(() => {
+              if (
+                quizRoot.ownerDocument.defaultView?.getComputedStyle(continueButton)
+                  .display === "none"
+              )
+                return null;
+              continueButton.click();
+              return true;
+            });
+          };
+          '''
+          new_handle = '''  /** @type {(taskDoc: Document, videoEl: HTMLMediaElement) => Promise<void>} */
+          const handleInteractiveQuiz = async (taskDoc, videoEl) => {
+            const timeline = await wait.element(
+              null,
+              SELECTORS.video.timelineClass,
+              taskDoc,
+            );
+
+            while (true) {
+              const quizRoot = await observeInteractiveQuiz(timeline, videoEl);
+              if (!quizRoot) return;
+
+              const answers = await wait.until(() => {
+                const result = getInteractiveQuizAnswers(timeline).filter(
+                  (answer) =>
+                    !answer.answered && String(answer.answerContent ?? "").trim(),
+                );
+                return result.length ? result : null;
+              });
+              assert(answers?.length, "视频互动题未读取到 answerContent");
+
+              const quizItems = await wait.elements(
+                null,
+                SELECTORS.video.quizItemClass,
+                quizRoot,
+              );
+              assert(
+                answers.length >= quizItems.length,
+                "视频互动题答案数量少于当前弹窗题目数量",
+              );
+
+              for (const [index, quizItem] of quizItems.entries()) {
+                await fillInteractiveQuiz(quizItem, answers[index]);
+              }
+
+              const submitButton = await wait.element(
+                null,
+                SELECTORS.video.quizSubmitId,
+                quizRoot,
+              );
+              submitButton.click();
+
+              const result = await wait.until(() => {
+                if (!timeline.contains(quizRoot)) return "closed";
+                const continueButton = /** @type {HTMLElement | null} */ (
+                  quizRoot.querySelector(SELECTORS.video.quizContinueId)
+                );
+                if (!continueButton) return null;
+                const style = quizRoot.ownerDocument.defaultView?.getComputedStyle(
+                  continueButton,
+                );
+                return style?.display !== "none" ? continueButton : null;
+              }, 15000);
+              assert(result, "视频互动题提交后未出现继续按钮，也未自动关闭");
+
+              if (result !== "closed") result.click();
+              await wait.until(
+                () => (!timeline.contains(quizRoot) ? true : null),
+                5000,
+              );
+            }
+          };
+          '''
+
+          old_start = '''    const isStarted = await wait.until(() => {
+              if (videoEl?.currentTime > 0 && !videoEl.paused) return true;
+              launchBtn.click();
+              return null;
+            });
+          '''
+          new_start = '''    const isStarted = await wait.until(() => {
+              if (taskDoc.querySelector(SELECTORS.video.quizClass)) return true;
+              if (videoEl?.currentTime > 0 && !videoEl.paused) return true;
+              launchBtn.click();
+              return null;
+            });
+          '''
+
+          for old, new, label in [
+              (old_get, new_get, 'answer reader'),
+              (old_handle, new_handle, 'quiz handler'),
+              (old_start, new_start, 'video start'),
+          ]:
+              if old not in text:
+                  raise SystemExit(f'baseline block not found: {label}')
+              text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8')
+      - name: Commit patched core.js
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src-tauri/src/scripts/core.js
+          git commit -m "fix: keep direct answers for video interactive quizzes"
+          git push origin HEAD:test/video-interactive-quiz-direct-answer
