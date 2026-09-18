@@ -1,0 +1,129 @@
+diff --git a/src-tauri/src/scripts/core.js b/src-tauri/src/scripts/core.js
+--- a/src-tauri/src/scripts/core.js
++++ b/src-tauri/src/scripts/core.js
+@@ -389,11 +389,14 @@
+   const getInteractiveQuizAnswers = (timeline) => {
+     const videoWindow = /** @type {VideoWindow | null} */ (
+       timeline.ownerDocument.defaultView
+     );
+-    const datas =
+-      videoWindow?.Ext?.getCmp?.(timeline.id)?.objects?.find(
+-        ({ style }) => style === "InteractiveQuiz",
+-      )?.datas ?? [];
++    const objects = videoWindow?.Ext?.getCmp?.(timeline.id)?.objects ?? [];
++    const datas = objects
++      .filter(
++        ({ style }) =>
++          style === "InteractiveQuiz" || String(style).toUpperCase() === "QUIZ",
++      )
++      .flatMap(({ datas }) => datas ?? []);
+     return datas.map(({ answered, answerContent, options }) => ({
+       answered,
+       answerContent,
+@@ -458,45 +461,60 @@
+       SELECTORS.video.timelineClass,
+       taskDoc,
+     );
+-    const answers = await wait.until(() => {
+-      const result = getInteractiveQuizAnswers(timeline);
+-      return result.length ? result : null;
+-    });
+-    if (!answers || answers.every((answer) => answer.answered)) return;
+-
+-    const quizRoot = await observeInteractiveQuiz(timeline, videoEl);
+-    if (!quizRoot) return;
+-
+-    const quizItems = await wait.elements(
+-      null,
+-      SELECTORS.video.quizItemClass,
+-      quizRoot,
+-    );
+-
+-    for (const [index, answer] of answers.entries()) {
+-      if (!answer.answered && quizItems[index])
+-        await fillInteractiveQuiz(quizItems[index], answer);
+-    }
+-
+-    const submitButton = await wait.element(
+-      null,
+-      SELECTORS.video.quizSubmitId,
+-      quizRoot,
+-    );
+-    submitButton.click();
+-
+-    const continueButton = await wait.element(
+-      null,
+-      SELECTORS.video.quizContinueId,
+-      quizRoot,
+-    );
+-    await wait.until(() => {
+-      if (
+-        quizRoot.ownerDocument.defaultView?.getComputedStyle(continueButton)
+-          .display === "none"
+-      )
+-        return null;
+-      continueButton.click();
+-      return true;
+-    });
++    while (true) {
++      const quizRoot = await observeInteractiveQuiz(timeline, videoEl);
++      if (!quizRoot) return;
++
++      const answers = await wait.until(() => {
++        const result = getInteractiveQuizAnswers(timeline).filter(
++          (answer) =>
++            !answer.answered && String(answer.answerContent ?? "").trim(),
++        );
++        return result.length ? result : null;
++      });
++      assert(answers?.length, "视频互动题未读取到 answerContent");
++
++      const quizItems = await wait.elements(
++        null,
++        SELECTORS.video.quizItemClass,
++        quizRoot,
++      );
++      assert(
++        answers.length >= quizItems.length,
++        "视频互动题答案数量少于当前弹窗题目数量",
++      );
++
++      for (const [index, quizItem] of quizItems.entries()) {
++        await fillInteractiveQuiz(quizItem, answers[index]);
++      }
++
++      const submitButton = await wait.element(
++        null,
++        SELECTORS.video.quizSubmitId,
++        quizRoot,
++      );
++      submitButton.click();
++
++      const result = await wait.until(() => {
++        if (!timeline.contains(quizRoot)) return "closed";
++        const continueButton = /** @type {HTMLElement | null} */ (
++          quizRoot.querySelector(SELECTORS.video.quizContinueId)
++        );
++        if (!continueButton) return null;
++        const style = quizRoot.ownerDocument.defaultView?.getComputedStyle(
++          continueButton,
++        );
++        return style?.display !== "none" ? continueButton : null;
++      }, 15000);
++      assert(result, "视频互动题提交后未出现继续按钮，也未自动关闭");
++
++      if (result !== "closed") result.click();
++      await wait.until(
++        () => (!timeline.contains(quizRoot) ? true : null),
++        5000,
++      );
++    }
+   };
+@@ -523,6 +541,7 @@
+     if (config.muteVideo) muteVideo(videoEl);
+ 
+     const isStarted = await wait.until(() => {
++      if (taskDoc.querySelector(SELECTORS.video.quizClass)) return true;
+       if (videoEl?.currentTime > 0 && !videoEl.paused) return true;
+       launchBtn.click();
+       return null;
