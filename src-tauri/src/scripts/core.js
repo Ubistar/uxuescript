@@ -499,8 +499,211 @@
     });
   };
 
-  /** @type {(taskDoc: Document) => Promise<void>} */
-  const handleVideo = async (taskDoc) => {
+  /**
+   * @typedef {{ name: string, isRight?: boolean | number | string }} QuizOption
+   * @typedef {{ resourceId: number, questionType: string, options: QuizOption[] }} VideoQuizData
+   * @typedef {{ style: string, datas: VideoQuizData[] }} VideoQuizEvent
+   * @typedef {{ question: VideoQuizData, next: number, pending: { answer: string, root: HTMLElement } | null, solved?: HTMLElement, continued?: HTMLElement }} VideoQuizProgress
+   * @typedef {(connection: unknown, response: { responseText: string }, options: { params?: { eventid?: number, answerContent?: string } }) => void} QuizResponseListener
+   * @typedef {{ getCmp: (id: string) => { objects?: VideoQuizEvent[], renderData?: VideoQuizData } | undefined, Ajax: { on: (event: string, listener: QuizResponseListener) => void, un: (event: string, listener: QuizResponseListener) => void } }} VideoQuizExt
+   */
+
+  /** @type {(question: VideoQuizData, index: number) => string[] | null} */
+  const getQuizAnswer = (question, index) => {
+    const { options, questionType } = question;
+    const multiple = questionType === "多选题";
+    const right = options.flatMap((option, i) =>
+      [true, 1, "1", "true"].includes(option.isRight ?? false) ? [i] : [],
+    );
+    const preferred =
+      right.length && (multiple || right.length === 1)
+        ? multiple
+          ? right.reduce((mask, i) => mask + 2 ** i, 0) - 1
+          : right[0]
+        : -1;
+    // Put an explicit Ext answer first, then enumerate the remaining candidates.
+    let candidate = index;
+    if (preferred >= 0) {
+      candidate = index === 0 ? preferred : index - 1;
+      if (index > 0 && candidate >= preferred) candidate++;
+    }
+    if (candidate >= (multiple ? 2 ** options.length - 1 : options.length))
+      return null;
+    return options.flatMap((option, i) =>
+      (multiple ? Math.floor((candidate + 1) / 2 ** i) % 2 : i === candidate)
+        ? [option.name]
+        : [],
+    );
+  };
+
+  /** @type {(node: Element | null) => boolean} */
+  const quizElementVisible = (node) =>
+    !!node?.isConnected &&
+    node.getClientRects().length > 0 &&
+    node.ownerDocument.defaultView?.getComputedStyle(node).visibility !==
+      "hidden";
+
+  /** @type {(timeline: HTMLElement, videoEl: HTMLMediaElement, ext: VideoQuizExt, events: VideoQuizEvent[], progress: Map<number, VideoQuizProgress>, handleOriginal: () => Promise<void>) => () => void} */
+  const attachQuizHook = (
+    timeline,
+    videoEl,
+    ext,
+    events,
+    progress,
+    handleOriginal,
+  ) => {
+    let active = true;
+    let busy = false;
+    let changed = false;
+    let originalHandled = false;
+    const originalId = events.find((event) => event.style === "InteractiveQuiz")
+      ?.datas[0]?.resourceId;
+
+    const check = async () => {
+      for (const state of progress.values()) {
+        if (state.continued && !quizElementVisible(state.continued))
+          state.continued = undefined;
+      }
+      if (!active || !videoEl.paused) return;
+      if (busy) {
+        changed = true;
+        return;
+      }
+      busy = true;
+      changed = false;
+      try {
+        const root = await wait.until(() =>
+          Array.from(timeline.querySelectorAll(SELECTORS.video.quizClass)).find(
+            quizElementVisible,
+          ),
+        );
+        if (!active || !root) return;
+        const data = ext.getCmp(root.id)?.renderData;
+        if (!data) return;
+        const state = progress.get(data.resourceId);
+        if (!state) {
+          // Mixed videos still delegate InteractiveQuiz to the original handler.
+          if (!originalHandled && data.resourceId === originalId) {
+            originalHandled = true;
+            await handleOriginal();
+          }
+          return;
+        }
+        if (state.pending || state.continued === root) return;
+        const button = await wait.until(() => {
+          const next = root.querySelector(SELECTORS.video.quizContinueId);
+          if (quizElementVisible(next))
+            return /** @type {HTMLElement} */ (next);
+          const submit = root.querySelector(SELECTORS.video.quizSubmitId);
+          return state.solved !== root && quizElementVisible(submit)
+            ? /** @type {HTMLElement} */ (submit)
+            : null;
+        });
+        if (!active || !button || !quizElementVisible(root)) return;
+        if (button.matches(SELECTORS.video.quizContinueId)) {
+          state.continued = /** @type {HTMLElement} */ (root);
+          button.click();
+          return;
+        }
+        const answer = getQuizAnswer(state.question, state.next);
+        if (!answer) {
+          progress.delete(data.resourceId);
+          console.warn("普通视频题候选答案均未通过，请手动作答");
+          return;
+        }
+        const ready = await wait.until(
+          () =>
+            root.querySelectorAll(SELECTORS.video.quizOptionClass).length ===
+            state.question.options.length,
+        );
+        if (!ready) throw new Error("普通视频题选项未加载完整");
+        await fillInteractiveQuiz(/** @type {HTMLElement} */ (root), {
+          options: state.question.options,
+          answerContent: answer.join(","),
+        });
+        if (!active || !quizElementVisible(root)) return;
+        state.pending = {
+          answer: answer.join(","),
+          root: /** @type {HTMLElement} */ (root),
+        };
+        console.info(`普通视频题：提交第 ${state.next + 1} 个候选`);
+        button.click();
+      } catch (error) {
+        console.error("普通视频题处理失败，停止自动作答", error);
+        dispose();
+      } finally {
+        busy = false;
+        if (changed) queueMicrotask(check);
+      }
+    };
+
+    /** @type {QuizResponseListener} */
+    const complete = (_connection, response, options) => {
+      const id = options.params?.eventid;
+      const state = id == null ? undefined : progress.get(id);
+      if (
+        !state?.pending ||
+        state.pending.answer !== options.params?.answerContent
+      )
+        return;
+      const root = state.pending.root;
+      state.pending = null;
+      try {
+        const result = JSON.parse(response.responseText);
+        if (result.status !== true || typeof result.isRight !== "boolean")
+          throw new Error("校验接口未返回明确的对错结果");
+        if (result.isRight) state.solved = root;
+        if (!result.isRight) state.next++;
+        console.info(
+          result.isRight
+            ? "普通视频题：答案正确"
+            : "普通视频题：答案错误，尝试下一项",
+        );
+        // Ext fires requestcomplete before the page's success callback updates DOM.
+        queueMicrotask(check);
+      } catch {
+        progress.delete(/** @type {number} */ (id));
+        console.warn("普通视频题校验失败，请手动作答");
+      }
+    };
+    /** @type {QuizResponseListener} */
+    const failed = (_connection, _response, options) => {
+      const id = options.params?.eventid;
+      if (id == null || !progress.get(id)?.pending) return;
+      progress.delete(id);
+      console.warn("普通视频题请求失败，停止重试，请手动作答");
+    };
+    const observer = new MutationObserver(check);
+    const dispose = () => {
+      active = false;
+      observer.disconnect();
+      videoEl.removeEventListener("pause", check);
+      timeline.ownerDocument.defaultView?.removeEventListener(
+        "pagehide",
+        dispose,
+      );
+      ext.Ajax.un("requestcomplete", complete);
+      ext.Ajax.un("requestexception", failed);
+      progress.clear();
+    };
+    observer.observe(timeline, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["style", "class"],
+    });
+    videoEl.addEventListener("pause", check);
+    timeline.ownerDocument.defaultView?.addEventListener("pagehide", dispose, {
+      once: true,
+    });
+    ext.Ajax.on("requestcomplete", complete);
+    ext.Ajax.on("requestexception", failed);
+    void check();
+    return dispose;
+  };
+
+  /** @type {(taskDoc: Document, taskComplete: Promise<boolean>) => Promise<void>} */
+  const handleVideo = async (taskDoc, taskComplete) => {
     console.info("开始处理Video任务点");
     const launchBtn = await wait.element(
       null,
@@ -518,25 +721,76 @@
     );
     if (config.muteVideo) muteVideo(videoEl);
 
-    const isStarted = await wait.until(() => {
-      if (videoEl?.currentTime > 0 && !videoEl.paused) return true;
-      launchBtn.click();
-      return null;
-    });
-    if (!isStarted) throw new Error("视频多次尝试无法启动播放");
+    /** @type {Map<number, VideoQuizProgress>} */
+    const quizProgress = new Map();
+    const timeline = await wait.element(
+      null,
+      SELECTORS.video.timelineClass,
+      taskDoc,
+      false,
+    );
+    const videoWindow = /** @type {Window & { Ext?: VideoQuizExt }} */ (
+      taskDoc.defaultView
+    );
+    const events = timeline
+      ? await wait.until(() => videoWindow.Ext?.getCmp(timeline.id)?.objects)
+      : null;
+    for (const event of events ?? []) {
+      if (event.style !== "QUIZ") continue;
+      for (const question of event.datas) {
+        quizProgress.set(question.resourceId, {
+          question,
+          next: 0,
+          pending: null,
+        });
+      }
+    }
+    const dropQuizHook = quizProgress.size
+      ? attachQuizHook(
+          timeline,
+          videoEl,
+          /** @type {VideoQuizExt} */ (videoWindow.Ext),
+          events ?? [],
+          quizProgress,
+          () => handleInteractiveQuiz(taskDoc, videoEl),
+        )
+      : null;
+    if (dropQuizHook) {
+      console.info(`已启用普通 QUIZ 钩子，共 ${quizProgress.size} 题`);
+      void taskComplete.then(dropQuizHook);
+    }
 
-    if (config.lockingSpeed) applySpeed(videoEl, config.videoSpeedValue);
-    await handleInteractiveQuiz(taskDoc, videoEl);
-    console.info("Video任务点处理完成");
+    try {
+      const isStarted = await wait.until(() => {
+        if (
+          dropQuizHook &&
+          Array.from(taskDoc.querySelectorAll(SELECTORS.video.quizClass)).some(
+            quizElementVisible,
+          )
+        )
+          return true;
+        if (videoEl?.currentTime > 0 && !videoEl.paused) return true;
+        launchBtn.click();
+        return null;
+      });
+      if (!isStarted) throw new Error("视频多次尝试无法启动播放");
 
-    if (config.debugTaskTypes.includes("Video")) {
-      // assert(
-      //   confirm(
-      //     "[DEBUG] Video 任务点处理完成。点击 [确定] 继续，点击 [取消] 中断。",
-      //   ),
-      //   "调试中断：用户取消了 Video 任务点",
-      // );
-      await sleep(5000);
+      if (config.lockingSpeed) applySpeed(videoEl, config.videoSpeedValue);
+      if (dropQuizHook) await taskComplete;
+      else await handleInteractiveQuiz(taskDoc, videoEl);
+      console.info("Video任务点处理完成");
+
+      if (config.debugTaskTypes.includes("Video")) {
+        // assert(
+        //   confirm(
+        //     "[DEBUG] Video 任务点处理完成。点击 [确定] 继续，点击 [取消] 中断。",
+        //   ),
+        //   "调试中断：用户取消了 Video 任务点",
+        // );
+        await sleep(5000);
+      }
+    } finally {
+      dropQuizHook?.();
     }
   };
 
@@ -819,11 +1073,10 @@
         continue;
       }
 
-      await safeRun(
-        () =>
-          Promise.all([handler(taskDoc), wait.taskPointComplete(container)]),
-        `${taskInfo} 处理异常，自动跳过，任务点类别：${type}`,
-      );
+      await safeRun(() => {
+        const taskComplete = wait.taskPointComplete(container);
+        return Promise.all([handler(taskDoc, taskComplete), taskComplete]);
+      }, `${taskInfo} 处理异常，自动跳过，任务点类别：${type}`);
     }
   };
 
